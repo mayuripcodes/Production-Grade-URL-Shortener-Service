@@ -1,0 +1,81 @@
+package cli
+
+import (
+	"os/signal"
+	"syscall"
+
+	"github.com/spf13/cobra"
+
+	"github.com/vancanhuit/url-shortener/internal/cache"
+	"github.com/vancanhuit/url-shortener/internal/config"
+	"github.com/vancanhuit/url-shortener/internal/migrate"
+	"github.com/vancanhuit/url-shortener/internal/server"
+	"github.com/vancanhuit/url-shortener/internal/shortener"
+	"github.com/vancanhuit/url-shortener/internal/store"
+)
+
+func newRunCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "run",
+		Short: "Run the HTTP server",
+		Long: "Run the HTTP server. Loads config from environment, opens the " +
+			"Postgres pool, mounts routes, and serves until SIGINT/SIGTERM " +
+			"triggers a graceful shutdown.",
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			cfg, err := config.Load()
+			if err != nil {
+				return err
+			}
+			logger, err := newLogger(cfg, cmd.ErrOrStderr())
+			if err != nil {
+				return err
+			}
+			logger.Info("starting url-shortener", "env", cfg.Env, "addr", cfg.Addr)
+
+			// Postgres is a required runtime dependency (enforced by
+			// config.Validate); DatabaseURL is guaranteed non-empty here.
+			if cfg.AutoMigrate {
+				logger.Info("auto_migrate=true; applying migrations before serving")
+				if err := migrate.Up(cmd.Context(), cfg.DatabaseURL); err != nil {
+					return err
+				}
+			}
+			st, err := store.NewWithPool(cmd.Context(), cfg.DatabaseURL, store.PoolConfig{
+				MaxConns:          cfg.DBMaxConns,
+				MinConns:          cfg.DBMinConns,
+				MaxConnLifetime:   cfg.DBMaxConnLifetime,
+				MaxConnIdleTime:   cfg.DBMaxConnIdleTime,
+				HealthCheckPeriod: cfg.DBHealthCheckPeriod,
+			})
+			if err != nil {
+				return err
+			}
+			defer st.Close()
+
+			// Redis is a required dependency (enforced by config.Validate),
+			// so RedisURL is guaranteed to be non-empty here.
+			cc, err := cache.New(cmd.Context(), cfg.RedisURL)
+			if err != nil {
+				return err
+			}
+			defer func() { _ = cc.Close() }()
+
+			// Cancel the run context on SIGINT/SIGTERM so the server can
+			// shut down gracefully.
+			ctx, stop := signal.NotifyContext(cmd.Context(), syscall.SIGINT, syscall.SIGTERM)
+			defer stop()
+
+			gen, err := shortener.NewGenerator(cfg.CodeLength)
+			if err != nil {
+				return err
+			}
+
+			srv := server.New(cfg, logger, server.Deps{
+				Store:     st,
+				Cache:     cc,
+				Generator: gen,
+			})
+			return srv.Run(ctx)
+		},
+	}
+}

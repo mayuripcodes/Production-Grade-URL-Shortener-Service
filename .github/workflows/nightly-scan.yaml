@@ -1,0 +1,117 @@
+# Nightly vulnerability re-scan of the published images.
+#
+# A passing `image` job in ci.yaml only proves the image was clean
+# *at build time*. CVEs disclosed afterwards can land against
+# components we already shipped (a fresh log4shell-style 0-day in a
+# pgx dep, a glibc CVE backported into the distroless base, etc.) --
+# the build is reproducible, the world is not.
+#
+# This workflow re-pulls the floating tags every morning and runs
+# `trivy image` against them. A red run means a CVE has appeared
+# against an image that's currently the recommended pull target;
+# fix it by bumping the offending dep on `main` and letting the
+# `image` job in ci.yaml republish `:edge`, then cut a release for
+# `:latest`.
+#
+# Why floating tags only:
+#   - `:edge` always exists once we've pushed to main; tracks dev.
+#   - `:latest` exists once a stable release ships; tracks prod.
+#   - Pinned tags (`:v1.2.3`, `:main-<sha>`) are immutable artefacts.
+#     A consumer pinned to one is responsible for their own scanning;
+#     re-scanning every historical tag from this side would just be
+#     noise here.
+name: nightly scan
+
+on:
+  # 22:30 UTC == 05:30 ICT (Asia/Ho_Chi_Minh, no DST). Picks an
+  # early-morning local hour so a failing scan is sitting in the
+  # inbox at the start of the working day, and avoids the
+  # top-of-hour stampede that GitHub-hosted schedulers hit daily.
+  # GitHub Actions cron is UTC-only -- no TZ field is supported.
+  schedule:
+    - cron: "30 22 * * *"
+  # Manual trigger for ad-hoc runs after a CVE disclosure or when
+  # validating a fix landed.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: read
+
+# Don't stack runs: if a scan is already going (long-running CVE DB
+# fetch, slow runner) and another fires, drop the duplicate.
+concurrency:
+  group: nightly-scan
+  cancel-in-progress: false
+
+env:
+  # Pin trivy from the workflow so a single bump on `main` rolls out
+  # to every scheduled run, and keep it in sync with TRIVY_VERSION
+  # in the Justfile (the recipe self-installs at this version).
+  TRIVY_VERSION: 0.70.0
+  REGISTRY: ghcr.io
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  scan:
+    name: trivy ${{ matrix.tag }}
+    runs-on: ubuntu-latest
+    strategy:
+      # `fail-fast: false` so a CVE in `:edge` doesn't cancel the
+      # `:latest` scan -- we want both verdicts every run, not the
+      # first failure.
+      fail-fast: false
+      matrix:
+        tag: [edge, latest]
+    steps:
+      # Audit-only runtime monitoring (step-security/harden-runner):
+      # logs every outbound connection, file write, and process spawn
+      # this job makes. Does NOT block in audit mode -- after a week
+      # or two of data via the job summary, flip `egress-policy` to
+      # `block` with a curated `allowed-endpoints` list. Repeated as
+      # the first step of every job below; see this comment for why.
+      - uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5 # v2.19.3
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      # `just trivy-scan` self-installs trivy at the version pinned
+      # in the Justfile (TRIVY_VERSION) into $HOME/.local/bin via
+      # BIN_DIR -- no Go/Node toolchain needed on the host. Trivy
+      # pulls the image directly from GHCR via OCI, so the runner's
+      # preinstalled Docker daemon is also unused here.
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+
+      # GHCR allows anonymous pulls for public packages, but logging
+      # in costs nothing and keeps the workflow working if the
+      # package visibility is ever flipped to private.
+      - name: Log in to GHCR
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # `:latest` only exists once a stable release ships; before
+      # the first tag, scanning it would always fail. Probe the
+      # registry first and skip the scan with a workflow notice
+      # rather than red-X'ing every nightly run until v1.0.0.
+      - name: Probe tag existence
+        id: probe
+        run: |
+          ref="${{ env.REGISTRY }}/${{ github.repository }}:${{ matrix.tag }}"
+          if docker manifest inspect "$ref" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::scanning $ref"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::$ref does not exist yet, skipping"
+          fi
+
+      # Same recipe `just trivy-image` uses, just pointed at a
+      # registry ref instead of the local-build tag. HIGH/CRITICAL
+      # gate, --ignore-unfixed, exit-code=1 on findings -- a red
+      # run is the alarm.
+      - name: just trivy-scan
+        if: steps.probe.outputs.exists == 'true'
+        run: |
+          just trivy-scan '${{ env.REGISTRY }}/${{ github.repository }}:${{ matrix.tag }}'

@@ -1,0 +1,16 @@
+{
+  "name": "url-shortener-tooling",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Repository tooling for the Production-Grade URL Shortener Service.",
+  "scripts": {
+    "prepare": "husky",
+    "lint:openapi": "spectral lint api/openapi.yaml --ruleset .spectral.yaml --fail-severity=warn"
+  },
+  "devDependencies": {
+    "@commitlint/cli": "^21.0.1",
+    "@commitlint/config-conventional": "^21.0.1",
+    "@stoplight/spectral-cli": "^6.16.0",
+    "husky": "^9.1.7"
+  }
+}

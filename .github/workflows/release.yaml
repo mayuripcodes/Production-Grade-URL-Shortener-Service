@@ -1,0 +1,217 @@
+# Release pipeline.
+#
+# Triggered by pushing a semver tag of the form `v1.2.3` or `v1.2.3-beta1`.
+# Produces, in parallel where it can:
+#
+#   1. A multi-arch (linux/amd64 + linux/arm64) container image published
+#      to GHCR under :<git-tag> (e.g. :v1.2.3, :v1.2.3-beta1) and
+#      :latest (the latter only on stable, non-prerelease tags). The
+#      image tag matches the git tag verbatim, including the leading
+#      `v`, so a `git checkout v1.2.3` and `docker pull ...:v1.2.3`
+#      reference the same artifact by the same name.
+#
+#   2. Cross-compiled binary archives for linux/{amd64,arm64} and
+#      darwin/{amd64,arm64} plus per-archive `.sha256` files and an
+#      aggregate `SHA256SUMS`, all uploaded as GitHub Release assets.
+#
+#   3. A GitHub Release whose body is the auto-generated changelog
+#      between the previous tag and the new one, grouped by
+#      conventional-commit type. Marked as a prerelease when the tag has
+#      a `-suffix` (e.g. v1.2.3-beta1).
+#
+# The image build runs first; the release job depends on it so we never
+# publish a release whose image push silently failed. Both jobs check
+# out with fetch-depth: 0 so `git describe` and `git log` see the full
+# history.
+name: release
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"          # v1.2.3
+      - "v[0-9]+.[0-9]+.[0-9]+-*"        # v1.2.3-beta1, v1.2.3-rc.1, ...
+
+permissions:
+  contents: read
+
+# Two concurrent runs for the same tag would race on the GH Release
+# create + asset upload. Different tags are independent.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  GO_VERSION: 1.26.3
+  NODE_VERSION: 24.15.0
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  # Opt every JS-based action into the Node 24 runtime ahead of the
+  # June 2026 deadline. Mirrors ci.yaml; see that file for the full
+  # rationale.
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  image:
+    name: docker image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      # Audit-only runtime monitoring (step-security/harden-runner):
+      # logs every outbound connection, file write, and process spawn
+      # this job makes. Does NOT block in audit mode -- after a week
+      # or two of data via the job summary, flip `egress-policy` to
+      # `block` with a curated `allowed-endpoints` list. Repeated as
+      # the first step of every job below; see this comment for why.
+      - uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5 # v2.19.3
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+
+      # Resolve VERSION (git tag verbatim, including leading `v`) and
+      # DATE (committer timestamp of HEAD, RFC3339 UTC) via the shared
+      # composite. ci.yaml uses the same composite with the default
+      # `version-source: describe` so the binary's `version` subcommand,
+      # the Docker image tag, and the git tag all report the same
+      # identifier on tag pushes.
+      - name: Resolve build metadata
+        id: meta-build
+        uses: ./.github/actions/resolve-build-metadata
+        with:
+          version-source: tag
+
+      # No setup-qemu-action: see ci.yaml's image job for the rationale.
+      # Every Dockerfile stage that runs commands is pinned to
+      # --platform=$BUILDPLATFORM and the Go builder cross-compiles via
+      # GOOS/GOARCH, so buildx never has to emulate target-arch code.
+      - uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+
+      - name: Log in to GHCR
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Image tag set: the git tag verbatim plus :latest on stable
+      # releases. `type=ref,event=tag` echoes refs/tags/<X> as :<X>,
+      # so pushing v1.2.3 publishes :v1.2.3 (matching the git tag
+      # 1:1). We deliberately don't emit rolling :MAJOR / :MAJOR.MINOR
+      # tags -- they're noisy for a small project, and a stable
+      # "track the latest 1.x" pointer is exactly what :latest is for
+      # once a major is the current line.
+      #
+      # `:latest` is moved only on stable (non-prerelease) tags, so
+      # pushing v1.2.3-beta1 publishes :v1.2.3-beta1 without touching
+      # the stable pointer. The dev counterpart (:edge) is moved by
+      # the ci.yaml `image` job on every main push.
+      - name: Derive image tags + labels
+        id: meta
+        uses: docker/metadata-action@030e881283bb7a6894de51c315a6bfe6a94e05cf # v6.0.0
+        env:
+          # Annotate both the manifest index and per-platform manifests
+          # so GHCR's package UI surfaces description/source/etc. for
+          # the multi-arch image. See ci.yaml's image job for the full
+          # rationale.
+          DOCKER_METADATA_ANNOTATIONS_LEVELS: index,manifest
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          # Static OCI fields are also baked into the Dockerfile; this
+          # block exists so docker/metadata-action emits them as part
+          # of the `annotations` output consumed below.
+          labels: |
+            org.opencontainers.image.title=url-shortener
+            org.opencontainers.image.description=A small URL-shortener service with a JSON API and HTMX web UI.
+            org.opencontainers.image.licenses=MIT
+            org.opencontainers.image.vendor=vancanhuit
+            org.opencontainers.image.documentation=https://github.com/${{ github.repository }}#readme
+          tags: |
+            type=ref,event=tag
+            type=raw,value=latest,enable=${{ !contains(github.ref_name, '-') }}
+
+      - name: Build and push multi-arch image
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Annotations populate the manifest index that GHCR's UI
+          # reads; labels populate the per-platform image configs.
+          annotations: ${{ steps.meta.outputs.annotations }}
+          build-args: |
+            VERSION=${{ steps.meta-build.outputs.version }}
+            COMMIT=${{ github.sha }}
+            DATE=${{ steps.meta-build.outputs.date }}
+          # Attach an SPDX SBOM (BuildKit's default scanner emits SPDX 2.3)
+          # and SLSA-style provenance in `max` mode (full source/build-step
+          # graph) as in-toto attestations on the manifest index.
+          # Released images are the ones consumers actually deploy from,
+          # so these matter most here -- a downstream user can always
+          # answer "what's in v1.2.3?" with one `docker buildx imagetools
+          # inspect` call instead of rebuilding from source. See ci.yaml's
+          # image job for the consumer-side fetch commands.
+          sbom: true
+          provenance: mode=max
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  release:
+    name: github release
+    needs: image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5 # v2.19.3
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+
+      # `just release-binaries` depends on `just web-build`, which runs
+      # `npm ci` in web/tailwind/. Same composite as ci.yaml.
+      - uses: ./.github/actions/setup-toolchain
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          node-version: ${{ env.NODE_VERSION }}
+
+      # The Justfile reads VERSION from `git describe --tags`, which on a
+      # tag push reports e.g. `v1.2.3` verbatim. The release-binaries
+      # recipe emits url-shortener_${VERSION}_${os}_${arch}.tar.gz
+      # under ./dist, plus per-archive .tar.gz.sha256 files and an
+      # aggregate SHA256SUMS.
+      - name: Build release binaries
+        run: just release-binaries
+
+      # Generate release-notes markdown for the (prev_tag, this_tag]
+      # range using git-cliff (cliff.toml). `--current` auto-resolves
+      # the previous semver tag from git's tag graph, so we don't need
+      # the prior `git describe` shuffle. Output is written to
+      # dist/CHANGELOG.md via the action's $OUTPUT env contract.
+      - name: Generate release notes
+        uses: orhun/git-cliff-action@f50e11560dce63f7c33227798f90b924471a88b5 # v4.8.0
+        with:
+          config: cliff.toml
+          args: --current
+        env:
+          OUTPUT: dist/CHANGELOG.md
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3.0.0
+        with:
+          name: ${{ github.ref_name }}
+          body_path: dist/CHANGELOG.md
+          # The leading `-` in the tag (e.g. v1.2.3-beta1) marks it as
+          # a prerelease per semver; Releases-page UX hides these from
+          # "Latest release".
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          files: |
+            dist/url-shortener_*.tar.gz
+            dist/url-shortener_*.tar.gz.sha256
+            dist/SHA256SUMS

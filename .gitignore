@@ -1,0 +1,40 @@
+# Binaries
+/bin/
+/dist/
+*.exe
+*.test
+*.out
+
+# Coverage
+coverage.out
+coverage.html
+
+# Editor / OS
+.idea/
+.vscode/*
+# Track shared editor settings so gopls/lint behave consistently for everyone.
+!.vscode/settings.json
+!.vscode/extensions.json
+.DS_Store
+*.swp
+
+# Env files
+.env
+.env.local
+.envrc
+
+# Node (commitlint / tailwind toolchain)
+node_modules/
+
+# Vite + Svelte build output. The Go binary embeds web/dist/ via
+# `//go:embed`, so `just build` re-runs `just web-build` whenever it's
+# missing. CI and the multi-stage Dockerfile do the same.
+/web/dist/
+
+# Vendored OpenAPI docs assets are copied into web/public/static/ at
+# build time by web/scripts/vendor-docs-assets.mjs. They're build
+# artifacts, not source -- the npm registry is the source of truth.
+/web/public/static/
+
+# Release artifacts produced by `just release-binaries`.
+/dist/
