@@ -45,7 +45,7 @@ var ErrLengthOutOfRange = errors.New("shortener: length out of range")
 // NewGenerator returns a Generator that emits codes of the given length.
 // length must satisfy MinLength <= length <= MaxLength.
 func NewGenerator(length int) (*Generator, error) {
-	if length < MinLength || length > MaxLength {
+	if !validLength(length) {
 		return nil, fmt.Errorf("%w: got %d, want [%d, %d]",
 			ErrLengthOutOfRange, length, MinLength, MaxLength)
 	}
@@ -85,7 +85,7 @@ func (g *Generator) Generate() (string, error) {
 // Used to validate user-supplied codes and to reject obvious junk in
 // path-parameter handlers without hitting the database.
 func ValidCode(code string) bool {
-	if len(code) < MinLength || len(code) > MaxLength {
+	if !validLength(len(code)) {
 		return false
 	}
 	for i := range len(code) {
@@ -106,4 +106,8 @@ func isBase62(b byte) bool {
 		return true
 	}
 	return false
+}
+
+func validLength(n int) bool {
+	return n >= MinLength && n <= MaxLength
 }
