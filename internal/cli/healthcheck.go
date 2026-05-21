@@ -39,19 +39,7 @@ func newHealthcheckCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			client := http.DefaultClient
-			if insecure {
-				// New client per call so we don't mutate
-				// http.DefaultTransport. The probe is short-lived
-				// and runs once per healthcheck invocation, so the
-				// allocation cost is irrelevant.
-				client = &http.Client{
-					Transport: &http.Transport{
-						TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, //nolint:gosec // intentional for in-container loopback probe
-					},
-					Timeout: timeout,
-				}
-			}
+			client := healthcheckClient(timeout, insecure)
 			resp, err := client.Do(req)
 			if err != nil {
 				return err
@@ -68,4 +56,19 @@ func newHealthcheckCmd() *cobra.Command {
 	cmd.Flags().DurationVar(&timeout, "timeout", 2*time.Second, "request timeout")
 	cmd.Flags().BoolVar(&insecure, "insecure", false, "skip TLS certificate verification (use with https:// URLs in compose healthchecks)")
 	return cmd
+}
+
+func healthcheckClient(timeout time.Duration, insecure bool) *http.Client {
+	if !insecure {
+		return http.DefaultClient
+	}
+	// New client per call so we don't mutate http.DefaultTransport.
+	// The probe is short-lived and runs once per healthcheck
+	// invocation, so the allocation cost is irrelevant.
+	return &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, //nolint:gosec // intentional for in-container loopback probe
+		},
+		Timeout: timeout,
+	}
 }
