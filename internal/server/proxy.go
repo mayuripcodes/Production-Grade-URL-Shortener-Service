@@ -19,6 +19,14 @@ import (
 // reaching here with an unparseable entry would mean the validator
 // has a bug -- worth the small belt-and-suspenders.)
 func buildIPExtractor(trustedProxies []string) echo.IPExtractor {
+	opts := trustedProxyOptions(trustedProxies)
+	if len(opts) == 0 {
+		return nil
+	}
+	return echo.ExtractIPFromXFFHeader(opts...)
+}
+
+func trustedProxyOptions(trustedProxies []string) []echo.TrustOption {
 	opts := make([]echo.TrustOption, 0, len(trustedProxies))
 	for _, cidr := range trustedProxies {
 		if cidr == "" {
@@ -30,8 +38,5 @@ func buildIPExtractor(trustedProxies []string) echo.IPExtractor {
 		}
 		opts = append(opts, echo.TrustIPRange(ipnet))
 	}
-	if len(opts) == 0 {
-		return nil
-	}
-	return echo.ExtractIPFromXFFHeader(opts...)
+	return opts
 }
