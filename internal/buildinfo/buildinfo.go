@@ -22,8 +22,14 @@ type Info struct {
 // Get returns the build metadata baked into this binary.
 func Get() Info {
 	return Info{
-		Version: version,
-		Commit:  commit,
-		Date:    date,
+		Version: Version(),
+		Commit:  Commit(),
+		Date:    Date(),
 	}
 }
+
+func Version() string { return version }
+
+func Commit() string { return commit }
+
+func Date() string { return date }
