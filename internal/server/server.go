@@ -99,21 +99,7 @@ func New(cfg config.Config, logger *slog.Logger, deps Deps) *Server {
 		e.IPExtractor = extractor
 	}
 
-	e.Use(middleware.Recover())
-	e.Use(middleware.RequestID())
-	e.Use(slogRequestLogger(logger))
-	// Cap request bodies before any handler reads them. Echo's
-	// BodyLimit short-circuits with 413 Request Entity Too Large
-	// when Content-Length exceeds the cap, and wraps the body
-	// reader so chunked / unknown-length requests are caught mid-
-	// read too. Applies to every route, including the static
-	// asset handler (where bodies are always empty in practice).
-	e.Use(middleware.BodyLimit(maxRequestBodyBytes))
-	// CORS is opt-in via config; no-op when CORSAllowedOrigins is
-	// empty (the default for same-origin SPA + API deployments).
-	if cors := buildCORS(cfg, logger); cors != nil {
-		e.Use(cors)
-	}
+	mountGlobalMiddleware(e, cfg, logger)
 
 	op := handlers.NewOperational()
 	op.AddReadinessCheck("postgres", func(ctx context.Context) error {
@@ -158,16 +144,14 @@ func New(cfg config.Config, logger *slog.Logger, deps Deps) *Server {
 	})
 	spa.Mount(e)
 
-	httpSrv := &http.Server{
-		Addr:              cfg.Addr,
-		Handler:           e,
-		ReadHeaderTimeout: readHeaderTimeout,
-		ReadTimeout:       readTimeout,
-		WriteTimeout:      writeTimeout,
-		IdleTimeout:       idleTimeout,
+	return &Server{
+		cfg:    cfg,
+		logger: logger,
+		deps:   deps,
+		echo:   e,
+		http:   newHTTPServer(cfg.Addr, e),
+		links:  links,
 	}
-
-	return &Server{cfg: cfg, logger: logger, deps: deps, echo: e, http: httpSrv, links: links}
 }
 
 // Run starts the HTTP server and blocks until ctx is canceled (typically by
@@ -274,6 +258,35 @@ func timeUntil(ctx context.Context) time.Duration {
 		return 0
 	}
 	return remaining
+}
+
+func mountGlobalMiddleware(e *echo.Echo, cfg config.Config, logger *slog.Logger) {
+	e.Use(middleware.Recover())
+	e.Use(middleware.RequestID())
+	e.Use(slogRequestLogger(logger))
+	// Cap request bodies before any handler reads them. Echo's
+	// BodyLimit short-circuits with 413 Request Entity Too Large
+	// when Content-Length exceeds the cap, and wraps the body
+	// reader so chunked / unknown-length requests are caught mid-
+	// read too. Applies to every route, including the static
+	// asset handler (where bodies are always empty in practice).
+	e.Use(middleware.BodyLimit(maxRequestBodyBytes))
+	// CORS is opt-in via config; no-op when CORSAllowedOrigins is
+	// empty (the default for same-origin SPA + API deployments).
+	if cors := buildCORS(cfg, logger); cors != nil {
+		e.Use(cors)
+	}
+}
+
+func newHTTPServer(addr string, handler http.Handler) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           handler,
+		ReadHeaderTimeout: readHeaderTimeout,
+		ReadTimeout:       readTimeout,
+		WriteTimeout:      writeTimeout,
+		IdleTimeout:       idleTimeout,
+	}
 }
 
 // slogRequestLogger returns Echo middleware that logs each request via slog.
