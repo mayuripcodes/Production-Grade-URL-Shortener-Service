@@ -252,6 +252,18 @@ func errResp(code, msg string) ErrorResponse {
 	return ErrorResponse{Error: msg, Code: code}
 }
 
+func jsonError(c *echo.Context, status int, code, msg string) error {
+	return c.JSON(status, errResp(code, msg))
+}
+
+func internalJSONError(c *echo.Context) error {
+	return jsonError(c, http.StatusInternalServerError, ErrCodeInternal, "internal error")
+}
+
+func notFoundJSONError(c *echo.Context) error {
+	return jsonError(c, http.StatusNotFound, ErrCodeNotFound, "not found")
+}
+
 // --- service-level helpers (exposed for the web handler) -------------------
 
 // ValidationError signals a user-input failure that should map to HTTP 422
@@ -405,7 +417,7 @@ func (h *Links) listPage(ctx context.Context, pageSize int, beforeID int64) ([]s
 func (h *Links) Create(c *echo.Context) error {
 	var req createReq
 	if err := json.NewDecoder(c.Request().Body).Decode(&req); err != nil {
-		return c.JSON(http.StatusBadRequest, errResp(ErrCodeInvalidJSONBody, "invalid json body"))
+		return jsonError(c, http.StatusBadRequest, ErrCodeInvalidJSONBody, "invalid json body")
 	}
 
 	link, created, err := h.Persist(c.Request().Context(), req.TargetURL, req.Code, req.ExpiresAt)
@@ -413,11 +425,11 @@ func (h *Links) Create(c *echo.Context) error {
 	case PersistErrNone:
 		// fall through to the success response below
 	case PersistErrValidation:
-		return c.JSON(status, errResp(ErrCodeValidation, msg))
+		return jsonError(c, status, ErrCodeValidation, msg)
 	case PersistErrCodeTaken:
-		return c.JSON(status, errResp(ErrCodeCodeTaken, "code already in use"))
+		return jsonError(c, status, ErrCodeCodeTaken, "code already in use")
 	case PersistErrInternal:
-		return c.JSON(status, errResp(ErrCodeInternal, "internal error"))
+		return internalJSONError(c)
 	}
 	status := http.StatusCreated
 	if !created {
@@ -453,21 +465,21 @@ func (h *Links) createWithRandomCode(ctx context.Context, target string, expires
 func (h *Links) Get(c *echo.Context) error {
 	code := c.Param("code")
 	if !shortener.ValidCode(code) {
-		return c.JSON(http.StatusNotFound, errResp(ErrCodeNotFound, "not found"))
+		return notFoundJSONError(c)
 	}
 	link, err := h.store.GetLinkByCode(c.Request().Context(), nil, code)
 	if errors.Is(err, store.ErrNotFound) {
-		return c.JSON(http.StatusNotFound, errResp(ErrCodeNotFound, "not found"))
+		return notFoundJSONError(c)
 	}
 	if err != nil {
 		h.logger.Error("links: get failed", "error", err, "code", code)
-		return c.JSON(http.StatusInternalServerError, errResp(ErrCodeInternal, "internal error"))
+		return internalJSONError(c)
 	}
 	if link.IsDeleted() {
-		return c.JSON(http.StatusGone, errResp(ErrCodeLinkDeleted, "link has been deleted"))
+		return jsonError(c, http.StatusGone, ErrCodeLinkDeleted, "link has been deleted")
 	}
 	if link.IsExpired() {
-		return c.JSON(http.StatusGone, errResp(ErrCodeLinkExpired, "link has expired"))
+		return jsonError(c, http.StatusGone, ErrCodeLinkExpired, "link has expired")
 	}
 	return c.JSON(http.StatusOK, h.makeResp(link))
 }
@@ -489,28 +501,12 @@ func (h *Links) Get(c *echo.Context) error {
 // The handler never returns 4xx for a syntactically valid request --
 // an unknown `before` cursor simply yields an empty page.
 func (h *Links) List(c *echo.Context) error {
-	limit := listDefaultPageSize
-	if raw := c.QueryParam("limit"); raw != "" {
-		if n, err := strconv.Atoi(raw); err == nil && n > 0 {
-			limit = n
-		}
-	}
-	if limit > listMaxPageSize {
-		limit = listMaxPageSize
-	}
-
-	var beforeID int64
-	if raw := c.QueryParam("before"); raw != "" {
-		if n, err := strconv.ParseInt(raw, 10, 64); err == nil && n > 0 {
-			beforeID = n
-		}
-	}
+	limit, beforeID := parseListParams(c)
 
 	rows, cursor, err := h.listPage(c.Request().Context(), limit, beforeID)
 	if err != nil {
 		h.logger.Error("links: list", "error", err)
-		return c.JSON(http.StatusInternalServerError,
-			errResp(ErrCodeInternal, "internal error"))
+		return internalJSONError(c)
 	}
 
 	items := make([]LinkResponse, len(rows))
@@ -545,16 +541,16 @@ func (h *Links) List(c *echo.Context) error {
 func (h *Links) Delete(c *echo.Context) error {
 	code := c.Param("code")
 	if !shortener.ValidCode(code) {
-		return c.JSON(http.StatusNotFound, errResp(ErrCodeNotFound, "not found"))
+		return notFoundJSONError(c)
 	}
 	ctx := c.Request().Context()
 	err := h.store.SoftDeleteLink(ctx, nil, code)
 	if errors.Is(err, store.ErrNotFound) {
-		return c.JSON(http.StatusNotFound, errResp(ErrCodeNotFound, "not found"))
+		return notFoundJSONError(c)
 	}
 	if err != nil {
 		h.logger.Error("links: delete failed", "error", err, "code", code)
-		return c.JSON(http.StatusInternalServerError, errResp(ErrCodeInternal, "internal error"))
+		return internalJSONError(c)
 	}
 	// Best-effort cache invalidation: a stale entry would only
 	// last `cacheTTL` anyway, but eagerly removing it makes the
@@ -774,6 +770,26 @@ func (h *Links) cachePut(ctx context.Context, l store.Link) {
 func cacheKey(code string) string { return "link:" + code }
 
 // --- helpers ----------------------------------------------------------------
+
+func parseListParams(c *echo.Context) (limit int, beforeID int64) {
+	limit = listDefaultPageSize
+	if raw := c.QueryParam("limit"); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n > 0 {
+			limit = n
+		}
+	}
+	if limit > listMaxPageSize {
+		limit = listMaxPageSize
+	}
+
+	if raw := c.QueryParam("before"); raw != "" {
+		if n, err := strconv.ParseInt(raw, 10, 64); err == nil && n > 0 {
+			beforeID = n
+		}
+	}
+
+	return limit, beforeID
+}
 
 func (h *Links) makeResp(l store.Link) LinkResponse {
 	return LinkResponse{
